@@ -1,0 +1,1116 @@
+import os
+import asyncio
+import sqlite3
+import hashlib
+import glob
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import base64
+from io import BytesIO
+import numpy as np
+from PIL import Image, ImageTk
+from colorama import Fore, Style
+from matplotlib import pyplot as plt
+from zhipuai import ZhipuAI
+import threading
+import platform
+import subprocess
+import datetime
+import re
+import random
+import shutil
+
+# ===== 常量与配置 =====
+_API_KEYS = {
+    "GLM": ""
+}
+
+
+# ===== 工具函数 =====
+def get_api_key(service):
+    """获取API密钥 - 优先使用硬编码密钥"""
+    service = service.upper()
+    if service in _API_KEYS:
+        return _API_KEYS[service]
+    return os.getenv(f"{service}_API_KEY") or None
+
+
+def log_info(msg):
+    print(f"{Fore.GREEN}🌸 {msg}{Style.RESET_ALL}")
+
+
+def log_warning(msg):
+    print(f"{Fore.YELLOW}⚠️ {msg}{Style.RESET_ALL}")
+
+
+def log_error(msg):
+    print(f"{Fore.RED}💥 {msg}{Style.RESET_ALL}")
+
+
+def hash_password(password):
+    """密码哈希处理"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def clear_folder(folder_path):
+    """清空指定文件夹"""
+    files = glob.glob(os.path.join(folder_path, "*"))
+    for file in files:
+        try:
+            os.remove(file)
+            print(f"✨ 已删除: {file}")
+        except Exception as e:
+            print(f"😢 删除失败: {file}, 原因: {e}")
+
+
+def merge_md_files():
+    """合并Markdown文件"""
+    md_files = glob.glob(os.path.join("output", "*.md"))
+    if not md_files:
+        print("😮 没有找到可合并的md文件~")
+        return False
+
+    # 按文件名排序
+    sorted_files = sorted(md_files, key=lambda x: os.path.basename(x))
+    merged_content = ""
+
+    for file in sorted_files:
+        try:
+            with open(file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                merged_content += content + "\n\n"
+                print(f"✅ 已合并: {os.path.basename(file)}")
+        except Exception as e:
+            print(f"😢 读取失败: {file}, 原因: {e}")
+
+    try:
+        with open(os.path.join("output", "all.md"), 'w', encoding='utf-8') as f:
+            f.write(merged_content)
+        print("🎉 合并完成! 已创建 all.md")
+        return True
+    except Exception as e:
+        print(f"😢 创建合并文件失败: {e}")
+        return False
+
+
+# ===== 核心API功能 =====
+async def image_to_markdown(image_path):
+    """将图片转换为Markdown格式"""
+    try:
+        api_key = get_api_key("GLM")
+        if not api_key:
+            log_error("GLM API密钥不可极简")
+            return None
+
+        if not os.path.exists(image_path):
+            log_error(f"图片文件不存在: {image_path}")
+            return None
+
+        if not image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+            log_error(f"不支持的文件类型: {image_path}")
+            return None
+
+        with Image.open(image_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG")
+            img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        client = ZhipuAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model="glm-4v-flash",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
+                    {"type": "text", "text": "请将图片内容转写为Markdown格式"}
+                ]
+            }],
+            stream=False,
+            max_tokens=1024,
+            temperature=0.5
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        log_error(f"图片处理异常: {str(e)}")
+        return None
+
+
+async def generate_answers(prompt):
+    """生成问题答案"""
+    try:
+        api_key = get_api_key("GLM")
+        if not api_key:
+            log_error("GLM API密钥不可用")
+            return None
+
+        client = ZhipuAI(api_key=api_key)
+
+        if len(prompt) > 2500:
+            truncated_prompt = prompt[:2400] + "...[内容过长已截断]"
+            log_warning(f"提示过长已截断: {len(prompt)}字符 → {len(truncated_prompt)}字符")
+            prompt = truncated_prompt
+
+        response = client.chat.completions.create(
+            model="glm-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=512,
+            stream=False
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        log_error(f"答案生成异常: {str(e)}")
+        return None
+
+
+# ===== 数据库管理 =====
+def init_db():
+    """初始化用户数据库"""
+    conn = sqlite3.connect('user_db.db')
+    c = conn.cursor()
+
+    # 用户表
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     username TEXT UNIQUE NOT NULL,
+                     password TEXT NOT NULL,
+                     role TEXT DEFAULT 'student')''')
+
+    # 题目分享表 - 修复缺少 likes 列的问题
+    c.execute('''CREATE TABLE IF NOT EXISTS shared_questions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL,
+                     title TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     tags TEXT,
+                     likes INTEGER DEFAULT 0,  
+                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                     FOREIGN KEY(user_id) REFERENCES users(id))''')
+    try:
+        c.execute("SELECT likes FROM shared_questions LIMIT 1")
+    except sqlite3.OperationalError:
+        # 如果列不存在，则添加
+        c.execute("ALTER TABLE shared_questions ADD COLUMN likes INTEGER DEFAULT 0")
+    # 评论表
+    c.execute('''CREATE TABLE IF NOT EXISTS comments (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     question_id INTEGER NOT NULL,
+                     user_id INTEGER NOT NULL,
+                     content TEXT NOT NULL,
+                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                     FOREIGN KEY(question_id) REFERENCES shared_questions(id),
+                     FOREIGN KEY(user_id) REFERENCES users(id))''')
+
+
+    conn.commit()
+    conn.close()
+
+
+class ExamHelperApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("智能数学助手")
+        self.root.geometry("800x600")
+        self.current_user = None
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+        self.photo_img = None
+        init_db()
+        self.show_login_page()
+
+    def clear_frame(self):
+        """清除当前框架中的所有组件"""
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+        self.photo_img = None
+
+    # ===== 用户认证功能 =====
+    def show_login_page(self):
+        """显示登录页面"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="智能数学助手", font=("Arial", 20)).pack(pady=30)
+        ttk.Button(self.main_frame, text="登录", command=self.show_login_form, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="注册", command=self.show_register_form, width=20).pack(pady=10)
+
+    def show_login_form(self):
+        """显示登录表单"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="用户登录", font=("Arial", 16)).pack(pady=20)
+
+        # 用户名输入
+        ttk.Label(self.main_frame, text="用户名:").pack()
+        self.login_username = ttk.Entry(self.main_frame, width=30)
+        self.login_username.pack(pady=5)
+
+        # 密码输入
+        ttk.Label(self.main_frame, text="密码:").pack()
+        self.login_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.login_password.pack(pady=5)
+
+        # 按钮区域
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="登录", command=self.login).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="返回", command=self.show_login_page).pack(side=tk.LEFT, padx=10)
+
+    def show_register_form(self):
+        """显示注册表单"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="用户注册", font=("Arial", 16)).pack(pady=20)
+
+        # 用户名输入
+        ttk.Label(self.main_frame, text="用户名:").pack()
+        self.reg_username = ttk.Entry(self.main_frame, width=30)
+        self.reg_username.pack(pady=5)
+
+        # 密码输入
+        ttk.Label(self.main_frame, text="密码:").pack()
+        self.reg_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.reg_password.pack(pady=5)
+
+        # 按钮区域
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="注册", command=self.register).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=self.show_login_page).pack(side=tk.LEFT, pad极简=10)
+
+    def login(self):
+        """处理登录逻辑"""
+        username = self.login_username.get()
+        password = self.login_password.get()
+
+        if not username or not password:
+            messagebox.showerror("错误", "用户名和密码不能为空")
+            return
+
+        hashed_pwd = hash_password(password)
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, hashed_pwd))
+            user = c.fetchone()
+
+            if user:
+                self.current_user = user[0]
+                self.show_main_page()
+            else:
+                messagebox.showerror("错误", "用户名或密码不正确")
+        except Exception as e:
+            messagebox.showerror("错误", f"数据库错误: {str(e)}")
+        finally:
+            conn.close()
+
+    def register(self):
+        """处理注册逻辑"""
+        username = self.reg_username.get()
+        password = self.reg_password.get()
+
+        if not username or not password:
+            messagebox.showerror("错误", "用户名和密码不能为空")
+            return
+
+        if len(password) < 6:
+            messagebox.showerror("错误", "密码长度至少为6位")
+            return
+
+        hashed_pwd = hash_password(password)
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("SELECT * FROM users WHERE username=?", (username,))
+            if c.fetchone():
+                messagebox.showerror("错误", "用户名已存在")
+                return
+
+            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_pwd))
+            conn.commit()
+            messagebox.showinfo("成功", "注册成功！")
+            self.show_login_page()
+        except Exception as e:
+            messagebox.showerror("错误", f"注册失败: {str(e)}")
+        finally:
+            conn.close()
+
+    def get_username(self):
+        """获取当前用户名"""
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("SELECT username FROM users WHERE id=?", (self.current_user,))
+            return c.fetchone()[0]
+        except:
+            return "用户"
+
+    def logout(self):
+        """退出登录"""
+        self.current_user = None
+        self.show_login_page()
+
+    # ===== 主页面功能 =====
+    def show_main_page(self):
+        """显示主页面"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text=f"欢迎, {self.get_username()}!", font=("Arial", 16)).pack(pady=20)
+
+        # 功能按钮
+        ttk.Button(self.main_frame, text="题目分析", command=self.show_exercise_page, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="文件管理", command=self.show_file_manager, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="题目分享社区", command=self.show_community_page, width=20).pack(pady=10)
+
+        # 账号管理功能
+        ttk.Button(self.main_frame, text="账号设置", command=self.show_account_settings, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="退出登录", command=self.logout, width=20).pack(pady=10)
+
+    # ===== 题目分析功能 =====
+    def show_exercise_page(self):
+        """显示题目分析页面"""
+        self.clear_frame()
+
+        # 添加顶部返回按钮
+        top_frame = ttk.Frame(self.main_frame)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(top_frame, text="← 返回主页面", command=self.show_main_page).pack(side=tk.LEFT)
+
+        ttk.Label(self.main_frame, text="题目分析", font=("Arial", 16)).pack(pady=10)
+
+        # 创建左右两个框架
+        left_frame = ttk.Frame(self.main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        right_frame = ttk.Frame(self.main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 左侧：文件选择和结果区域
+        self.setup_file_selection(left_frame)
+        self.setup_result_area(left_frame)
+
+        # 右侧：图片预览区域
+        self.setup_image_preview(right_frame)
+
+    def setup_file_selection(self, parent):
+        """设置文件选择区域"""
+        file_frame = ttk.LabelFrame(parent, text="选择题目图片")
+        file_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.file_path = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_path, state="readonly", width=30).pack(
+            side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(file_frame, text="浏览...", command=self.select_file).pack(side=tk.LEFT, padx=5)
+
+    def setup_result_area(self, parent):
+        """设置结果区域"""
+        ttk.Button(parent, text="分析错题", command=self.analyze_exercise, width=20).pack(pady=10)
+
+        result_frame = ttk.LabelFrame(parent, text="分析结果")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        scrollbar = ttk.Scrollbar(result_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.result_text = tk.Text(result_frame, wrap=tk.WORD, yscrollcommand=scrollbar.set)
+        self.result_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.result_text.yview)
+
+        # 添加分享按钮
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="分享到社区", command=self.share_from_analysis, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="保存结果", command=self.save_result, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="返回主页面", command=self.show_main_page, width=15).pack(side=tk.LEFT, padx=5)
+
+    def setup_image_preview(self, parent):
+        """设置图片预览区域"""
+        image_frame = ttk.LabelFrame(parent, text="题目图片预览")
+        image_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.canvas = tk.Canvas(image_frame, bg="white", width=300, height=400)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.canvas.create_text(150, 200, text="请选择题目图片", font=("Arial", 14), fill="gray")
+
+    def select_file(self):
+        """选择图片文件并预览"""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("图片文件", "*.png;*.jpg;*.jpeg")]
+        )
+        if file_path:
+            self.file_path.set(file_path)
+            self.display_image(file_path)
+
+    def display_image(self, image_path):
+        """在画布上显示选择的图片"""
+        try:
+            self.canvas.delete("all")
+            img = Image.open(image_path)
+            img_width, img_height = img.size
+            canvas_width = self.canvas.winfo_width() or 300
+            canvas_height = self.canvas.winfo_height() or 400
+
+            # 计算缩放比例
+            scale = min(canvas_width / img_width, canvas_height / img_height)
+            new_width = int(img_width * scale)
+            new_height = int(img_height * scale)
+
+            # 缩放图片
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            self.photo_img = ImageTk.PhotoImage(img)
+
+            # 在画布上显示图片
+            self.canvas.create_image(
+                canvas_width // 2,
+                canvas_height // 2,
+                anchor=tk.CENTER,
+                image=self.photo_img
+            )
+        except Exception as e:
+            log_error(f"图片显示异常: {str(e)}")
+            self.canvas.create_text(150, 200, text="图片加载失败", font=("Arial", 14), fill="red")
+
+    def analyze_exercise(self):
+        """分析错题"""
+        file_path = self.file_path.get()
+        if not file_path:
+            messagebox.showerror("错误", "请先选择错题图片")
+            return
+
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "正在分析中，请稍候...\n")
+        self.root.update()
+
+        threading.Thread(target=self.run_async_analysis, args=(file_path,)).start()
+
+    def run_async_analysis(self, file_path):
+        """异步运行分析任务"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(self.async_analyze_exercise(file_path))
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, result)
+        except Exception as e:
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, f"分析失败: {str(e)}")
+        finally:
+            loop.close()
+
+    async def async_analyze_exercise(self, file_path):
+        """异步分析错题"""
+        md_content = await image_to_markdown(file_path)
+        if not md_content:
+            return "图片识别失败，请重试或检查API密钥"
+
+        prompt = f"这是一道错题，请分析错误原因并提供正确解法：\n{md_content}"
+        answers = await generate_answers(prompt)
+        return answers if answers else "答案生成失败，请重试或检查API密钥"
+
+    def save_result(self):
+        """保存分析结果到文件"""
+        content = self.result极简.get("1.0", tk.END)
+        if not content.strip():
+            messagebox.showwarning("警告", "没有内容可保存")
+            return
+
+        # 生成时间戳文件名
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"analysis_{timestamp}.md"
+        filepath = os.path.join("output", filename)
+
+        try:
+            os.makedirs("output", exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            messagebox.showinfo("成功", f"结果已保存到:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {str(e)}")
+
+    def share_from_analysis(self):
+        """从分析页面分享题目到社区"""
+        if not self.current_user:
+            messagebox.showerror("错误", "请先登录")
+            return
+
+        content = self.result_text.get("1.0", tk.END).strip()
+
+        if not content:
+            messagebox.showwarning("警告", "没有内容可分享")
+            return
+
+        self.share_question(content)
+
+    # ===== 文件管理功能 =====
+    def show_file_manager(self):
+        """显示文件管理页面"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="文件管理", font=("Arial", 16)).pack(pady=20)
+
+        # 文件夹管理选项
+        ttk.Button(self.main_frame, text="清空图片文件夹", command=lambda: self.clear_folder("images"), width=20).pack(
+            pady=10)
+        ttk.Button(self.main_frame, text="清空输出文件夹", command=lambda: self.clear_folder("output"), width=20).pack(
+            pady=10)
+        ttk.Button(self.main_frame, text="合并Markdown文件", command=self.run_merge_md_files, width=20).pack(pady=10)
+
+        # 打开文件夹按钮
+        ttk.Button(self.main_frame, text="打开图片文件夹", command=lambda: self.open_folder("images"), width=20).pack(
+            pady=10)
+        ttk.Button(self.main_frame, text="打开输出文件夹", command=lambda: self.open_folder("output"), width=20).pack(
+            pady=10)
+
+        # 返回按钮
+        ttk.Button(self.main_frame, text="返回主页面", command=self.show_main_page, width=20).pack(pady=10)
+
+    def clear_folder(self, folder_name):
+        """清空指定文件夹"""
+        if messagebox.askyesno("确认", f"确定要清空 {folder_name} 文件夹吗？"):
+            clear_folder(folder_name)
+            messagebox.showinfo("完成", f"{folder_name} 文件夹已清空")
+
+    def run_merge_md_files(self):
+        """运行合并Markdown文件操作"""
+        if merge_md_files():
+            messagebox.showinfo("成功", "Markdown文件合并完成！")
+        else:
+            messagebox.showwarning("警告", "没有找到可合并的Markdown文件")
+
+    def open_folder(self, folder_name):
+        """打开指定文件夹"""
+        folder_path = os.path.abspath(folder_name)
+
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path, exist_ok=True)
+
+        try:
+            if platform.system() == "Windows":
+                os.startfile(folder_path)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.Popen(["open", folder_path])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", folder_path])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开文件夹: {str(e)}")
+
+    # ===== 账号管理功能 =====
+    def show_account_settings(self):
+        """显示账号设置页面"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="账号设置", font=("Arial", 16)).pack(pady=20)
+        ttk.Button(self.main_frame, text="修改密码", command=self.show_change_password, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="账户注销", command=self.show_delete_account, width=20).pack(pady=10)
+        ttk.Button(self.main_frame, text="返回主页面", command=self.show_main_page, width=20).pack(pady=10)
+
+    def show_change_password(self):
+        """显示修改密码表单"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="修改密码", font=("Arial", 16)).pack(pady=20)
+
+        # 原密码输入
+        ttk.Label(self.main_frame, text="原密码:").pack()
+        self.old_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.old_password.pack(pady=5)
+
+        # 新密码输入
+        ttk.Label(self.main_frame, text="新密码:").pack()
+        self.new_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.new_password.pack(pady=5)
+
+        # 确认新密码输入
+        ttk.Label(self.main_frame, text="确认新密码:").pack()
+        self.confirm_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.confirm_password.pack(pady=5)
+
+        # 按钮区域
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="确认修改", command=self.change_password).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="返回", command=self.show_account_settings).pack(side=tk.LEFT, padx=10)
+
+    def change_password(self):
+        """处理密码修改逻辑"""
+        old_pwd = self.old_password.get()
+        new_pwd = self.new_password.get()
+        confirm_pwd = self.confirm_password.get()
+
+        if not all([old_pwd, new_pwd, confirm_pwd]):
+            messagebox.showerror("错误", "所有字段都必须填写")
+            return
+
+        if new_pwd != confirm_pwd:
+            messagebox.showerror("错误", "两次输入的新密码不一致")
+            return
+
+        if len(new_pwd) < 6:
+            messagebox.showerror("错误", "新密码长度至少为6极简")
+            return
+
+        hashed_old = hash_password(old_pwd)
+        hashed_new = hash_password(new_pwd)
+
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("SELECT * FROM users WHERE id=? AND password=?", (self.current_user, hashed_old))
+            if not c.fetchone():
+                messagebox.showerror("错误", "原密码不正确")
+                return
+
+            c.execute("UPDATE users SET password=? WHERE id=?", (hashed_new, self.current_user))
+            conn.commit()
+            messagebox.showinfo("成功", "密码修改成功！")
+            self.show_account_settings()
+        except Exception as e:
+            messagebox.showerror("错误", f"密码修改失败: {str(e)}")
+        finally:
+            conn.close()
+
+    def show_delete_account(self):
+        """显示账户注销页面"""
+        self.clear_frame()
+        ttk.Label(self.main_frame, text="账户注销", font=("Arial", 16)).pack(pady=20)
+        ttk.Label(self.main_frame, text="此操作将永久删除您的账户！", foreground="red").pack()
+
+        # 密码确认输入
+        ttk.Label(self.main_frame, text="请输入密码确认:").pack(pady=10)
+        self.delete_password = ttk.Entry(self.main_frame, show="*", width=30)
+        self.delete_password.pack(pady=5)
+
+        # 按钮区域
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="确认注销", command=self.delete_account).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="返回", command=self.show_account_settings).pack(side=tk.LEFT, padx=10)
+
+    def delete_account(self):
+        """处理账户注销逻辑"""
+        password = self.delete_password.get()
+        if not password:
+            messagebox.showerror("错误", "请输入密码")
+            return
+
+        hashed_pwd = hash_password(password)
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("SELECT * FROM users WHERE id=? AND password=?", (self.current_user, hashed_pwd))
+            if not c.fetchone():
+                messagebox.showerror("错误", "密码不正确")
+                return
+
+            c.execute("DELETE FROM users WHERE id=?", (self.current_user,))
+            conn.commit()
+            messagebox.showinfo("成功", "账户已成功注销")
+            self.logout()
+        except Exception as e:
+            messagebox.showerror("错误", f"账户注销失败: {str(e)}")
+        finally:
+            conn.close()
+
+    # ===== 社区功能 =====
+    def show_community_page(self):
+        """显示题目分享社区页面"""
+        self.clear_frame()
+
+        # 添加顶部返回按钮
+        top_frame = ttk.Frame(self.main_frame)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(top_frame, text="← 返回主页面", command=self.show_main_page).pack(side=tk.LEFT)
+
+        ttk.Label(self.main_frame, text="题目分享社区", font=("Arial", 16)).pack(pady=10)
+
+        # 功能按钮区
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        ttk.Button(btn_frame, text="分享题目", command=lambda: self.share_question(None)).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="我的分享", command=self.show_my_shared).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="热门题目", command=self.show_hot_questions).pack(side=tk.LEFT)
+
+        # 搜索区
+        search_frame = ttk.Frame(self.main_frame)
+        search_frame.pack(fill=tk.X, padx=20, pady=5)
+
+        ttk.Label(search_frame, text="搜索:").pack(side=tk.LEFT)
+        self.search_entry = ttk.Entry(search_frame, width=30)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="搜索", command=self.search_questions).pack(side=tk.LEFT)
+
+        # 题目列表
+        list_frame = ttk.LabelFrame(self.main_frame, text="最新题目")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # 使用Treeview显示题目列表
+        columns = ("id", "title", "author", "likes", "date")
+        self.question_tree = ttk.Treeview(
+            list_frame,
+            columns=columns,
+            show="headings"
+        )
+
+        # 设置列宽和标题
+        self.question_tree.column("id", width=50, anchor="center")
+        self.question_tree.heading("id", text="ID")
+        self.question_tree.column("title", width=200)
+        self.question_tree.heading("title", text="标题")
+        self.question_tree.column("author", width=80)
+        self.question_tree.heading("author", text="作者")
+        self.question_tree.column("likes", width=50)
+        self.question_tree.heading("likes", text="点赞")
+        self.question_tree.column("date", width=80)
+        self.question_tree.heading("date", text="日期")
+
+        # 添加滚动条
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.question_tree.yview)
+        self.question_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.question_tree.pack(fill="both", expand=True)
+
+        # 绑定选择事件
+        self.question_tree.bind("<<TreeviewSelect>>", self.show_question_detail)
+
+        # 加载题目数据
+        self.load_community_questions()
+
+    def load_community_questions(self):
+        """加载社区题目"""
+        try:
+            # 清空现有数据
+            for item in self.question_tree.get_children():
+                self.question_tree.delete(item)
+
+            # 从数据库获取数据
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT sq.id, sq.title, 
+                       CASE WHEN sq.user_id = 0 THEN '系统' ELSE u.username END as author, 
+                       sq.likes, sq.created_at
+                FROM shared_questions sq
+                LEFT JOIN users u ON sq.user_id = u.id
+                ORDER BY sq.created_at DESC
+                LIMIT 50
+            """)
+            questions = c.fetchall()
+
+            # 添加到列表
+            for q in questions:
+                # 格式化日期
+                created_at = q[4].split()[0] if isinstance(q[4], str) else q[4]
+                self.question_tree.insert("", "end", values=(q[0], q[1], q[2], q[3], created_at))
+
+            conn.close()
+        except Exception as e:
+            log_error(f"加载题目失败: {str(e)}")
+            messagebox.showerror("错误", f"加载题目失败: {str(e)}")
+
+    def share_question(self, content=None):
+        """分享题目"""
+        if not self.current_user:
+            messagebox.showerror("错误", "请先登录")
+            return
+
+        # 创建分享窗口
+        share_win = tk.Toplevel(self.root)
+        share_win.title("分享题目")
+        share_win.geometry("600x500")
+
+        # 标题输入
+        ttk.Label(share_win, text="题目标题:").pack(pady=(10, 5))
+        title_entry = ttk.Entry(share_win, width=50)
+        title_entry.pack(pady=5)
+
+        # 内容输入
+        ttk.Label(share_win, text="题目内容 (Markdown格式):").pack(pady=(10, 5))
+        content_text = tk.Text(share_win, wrap="word", height=10)
+        scrollbar = ttk.Scrollbar(share_win, command=content_text.yview)
+        content_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        content_text.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # 如果从分析页面传入内容，则填充
+        if content:
+            content_text.insert(tk.END, content)
+
+        # 标签输入
+        ttk.Label(share_win, text="标签 (逗号分隔):").pack(pady=(10, 5))
+        tags_entry = ttk.Entry(share_win, width=50)
+        tags_entry.pack(pady=5)
+
+        def submit_question():
+            """提交题目分享"""
+            title = title_entry.get().strip()
+            content = content_text.get("1.0", tk.END).strip()
+            tags = tags_entry.get().strip()
+
+            if not title:
+                messagebox.showerror("错误", "标题不能为空")
+                return
+
+            if not content:
+                messagebox.showerror("错误", "内容不能为空")
+                return
+
+            try:
+                conn = sqlite3.connect('user_db.db')
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO shared_questions (user_id, title, content, tags)
+                    VALUES (?, ?, ?, ?)
+                """, (self.current_user, title, content, tags))
+                conn.commit()
+                conn.close()
+                messagebox.showinfo("成功", "题目分享成功！")
+                share_win.destroy()
+                self.load_community_questions()  # 刷新列表
+            except Exception as e:
+                messagebox.showerror("错误", f"分享失败: {str(e)}")
+
+        # 提交按钮
+        btn_frame = ttk.Frame(share_win)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="提交", command=submit_question).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=share_win.destroy).pack(side=tk.LEFT, padx=10)
+
+    def show_my_shared(self):
+        """显示我分享的题目"""
+        if not self.current_user:
+            messagebox.showerror("错误", "请先登录")
+            return
+
+        # 清空现有数据
+        for item in self.question_tree.get_children():
+            self.question_tree.delete(item)
+
+        try:
+            # 从数据库获取数据
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, title, created_at, likes
+                FROM shared_questions
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (self.current_user,))
+            questions = c.fetchall()
+
+            # 添加到列表
+            for q in questions:
+                # 格式化日期
+                created_at = q[2].split()[0] if isinstance(q[2], str) else q[2]
+                self.question_tree.insert("", "end", values=(q[0], q[1], self.get_username(), q[3], created_at))
+
+            conn.close()
+            messagebox.showinfo("提示", f"已显示您分享的 {len(questions)} 个题目")
+        except Exception as e:
+            log_error(f"加载题目失败: {str(e)}")
+            messagebox.showerror("错误", f"加载题目失败: {str(e)}")
+
+    def show_hot_questions(self):
+        """显示热门题目"""
+        # 清空现有数据
+        for item in self.question_tree.get_children():
+            self.question_tree.delete(item)
+
+        try:
+            # 从数据库获取数据
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT sq.id, sq.title, 
+                       CASE WHEN sq.user_id = 0 THEN '系统' ELSE u.username END as author, 
+                       sq.likes, sq.created_at
+                FROM shared_questions sq
+                LEFT JOIN users u ON sq.user_id = u.id
+                ORDER BY sq.likes DESC, sq.created_at DESC
+                LIMIT 20
+            """)
+            questions = c.fetchall()
+
+            # 添加到列表
+            for q in questions:
+                # 格式化日期
+                created_at = q[4].split()[0] if isinstance(q[4], str) else q[4]
+                self.question_tree.insert("", "end", values=(q[0], q[1], q[2], q[3], created_at))
+
+            conn.close()
+            messagebox.showinfo("提示", f"已显示 {len(questions)} 个热门题目")
+        except Exception as e:
+            log_error(f"加载题目失败: {str(e)}")
+            messagebox.showerror("错误", f"加载题目失败: {str(e)}")
+
+    def search_questions(self):
+        """搜索题目"""
+        keyword = self.search_entry.get().strip()
+        if not keyword:
+            messagebox.showwarning("提示", "请输入搜索关键词")
+            return
+
+        # 清空现有数据
+        for item in self.question_tree.get_children():
+            self.question_tree.delete(item)
+
+        try:
+            # 从数据库获取数据
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT sq.id, sq.title, 
+                       CASE WHEN sq.user_id = 0 THEN '系统' ELSE u.username END as author, 
+                       sq.likes, sq.created_at
+                FROM shared_questions sq
+                LEFT JOIN users u ON sq.user_id = u.id
+                WHERE sq.title LIKE ? OR sq.content LIKE ? OR sq.tags LIKE ?
+                ORDER BY sq.created_at DESC
+            """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"))
+            questions = c.fetchall()
+
+            # 添加到列表
+            for q in questions:
+                # 格式化日期
+                created_at = q[4].split()[0] if isinstance(q[4], str) else q[4]
+                self.question_tree.insert("", "end", values=(q[0], q[1], q[2], q[3], created_at))
+
+            conn.close()
+            messagebox.showinfo("提示", f"找到 {len(questions)} 个相关题目")
+        except Exception as e:
+            log_error(f"搜索失败: {str(e)}")
+            messagebox.showerror("错误", f"搜索失败: {str(e)}")
+
+    def show_question_detail(self, event):
+        """显示题目详情"""
+        selected = self.question_tree.focus()
+        if not selected:
+            return
+
+        values = self.question_tree.item(selected, "values")
+        if not values:
+            return
+
+        question_id = values[0]
+
+        # 从数据库获取题目详情
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT sq.title, sq.content, 
+                       CASE WHEN sq.user_id = 0 THEN '系统' ELSE u.username END as author, 
+                       sq.created_at
+                FROM shared_questions sq
+                LEFT JOIN users u ON sq.user_id = u.id
+                WHERE sq.id = ?
+            """, (question_id,))
+            question = c.fetchone()
+            conn.close()
+
+            if not question:
+                messagebox.showerror("错误", "题目不存在")
+                return
+        except Exception as e:
+            messagebox.showerror("错误", f"加载题目失败: {str(e)}")
+            return
+
+        # 创建详情窗口
+        detail_win = tk.Toplevel(self.root)
+        detail_win.title(f"题目详情 - {question[0]}")
+        detail_win.geometry("900x700")
+
+        # 使用Notebook分标签页
+        notebook = ttk.Notebook(detail_win)
+        notebook.pack(fill="both", expand=True)
+
+        # 内容标签页
+        content_frame = ttk.Frame(notebook)
+        notebook.add(content_frame, text="题目内容")
+
+        # 使用Text组件显示内容
+        ttk.Label(content_frame, text="题目分析:").pack(pady=(10, 5))
+        content_text = tk.Text(content_frame, wrap="word", height=15)
+        scrollbar = ttk.Scrollbar(content_frame, command=content_text.yview)
+        content_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        content_text.pack(fill="both", expand=True, padx=10, pady=5)
+        content_text.insert("end", question[1] if question[1] else "暂无详细内容")
+        content_text.config(state=tk.DISABLED)  # 设置为只读
+
+        # 评论标签页
+        comment_frame = ttk.Frame(notebook)
+        notebook.add(comment_frame, text=f"评论")
+
+        # 添加评论功能
+        comment_entry = tk.Text(comment_frame, height=5)
+        comment_entry.pack(fill="x", padx=10, pady=10)
+
+        def submit_comment():
+            """提交评论"""
+            content = comment_entry.get("1.0", "end").strip()
+            if not content:
+                messagebox.showwarning("提示", "评论内容不能为空")
+                return
+
+            try:
+                conn = sqlite3.connect('user_db.db')
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO comments (question_id, user_id, content)
+                    VALUES (?, ?, ?)
+                """, (question_id, self.current_user, content))
+                conn.commit()
+                conn.close()
+                messagebox.showinfo("成功", "评论已提交")
+                comment_entry.delete("1.0", tk.END)  # 清空评论框
+            except Exception as e:
+                messagebox.showerror("错误", f"提交评论失败: {str(e)}")
+
+        ttk.Button(comment_frame, text="提交评论", command=submit_comment).pack(pady=5)
+
+        # 互动功能
+        action_frame = ttk.Frame(detail_win)
+        action_frame.pack(fill="x", padx=10, pady=5)
+
+        # 点赞功能
+        like_btn = ttk.Button(action_frame, text="👍 点赞",
+                              command=lambda: self.like_question(question_id))
+        like_btn.pack(side="left", padx=5)
+
+        # 收藏功能
+        fav_btn = ttk.Button(action_frame, text="⭐ 收藏",
+                             command=lambda: self.favorite_question(question_id))
+        fav_btn.pack(side="left", padx=5)
+
+        # 关闭按钮
+        ttk.Button(action_frame, text="关闭", command=detail_win.destroy).pack(side="right", padx=5)
+
+    def like_question(self, question_id):
+        """点赞题目"""
+        try:
+            conn = sqlite3.connect('user_db.db')
+            c = conn.cursor()
+            c.execute("""
+                UPDATE shared_questions 
+                SET likes = likes + 1 
+                WHERE id = ?
+            """, (question_id,))
+            conn.commit()
+            conn.close()
+            messagebox.showinfo("成功", "已点赞")
+        except Exception as e:
+            messagebox.showerror("错误", f"点赞失败: {str(e)}")
+
+    def favorite_question(self, question_id):
+        """收藏题目"""
+        messagebox.showinfo("提示", "收藏功能已记录")
+
+
+# ===== 主程序入口 =====
+if __name__ == "__main__":
+    # 创建必要文件夹
+    for folder in ["images", "output"]:
+        os.makedirs(folder, exist_ok=True)
+
+    root = tk.Tk()
+    style = ttk.Style()
+    style.configure("TButton", padding=6, relief="flat", background="#ccc")
+    app = ExamHelperApp(root)
+    root.mainloop()
